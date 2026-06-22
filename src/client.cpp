@@ -11,6 +11,7 @@
 #include "util/clara.hpp"
 #include "util/format.hpp"
 #include "util/hex_checker.hpp"
+#include "util/output.hpp"
 
 waybar::Client* waybar::Client::inst() {
   static auto* c = new Client();
@@ -170,8 +171,17 @@ void waybar::Client::handleMonitorRemoved(Glib::RefPtr<Gdk::Monitor> monitor) {
 }
 
 void waybar::Client::handleDeferredMonitorRemoval(Glib::RefPtr<Gdk::Monitor> monitor) {
+  std::vector<waybar_output*> outputs_pending_removal;
+  for (auto& output : outputs_) {
+    if (output.monitor == monitor) {
+      outputs_pending_removal.push_back(&output);
+    }
+  }
+
   for (auto it = bars.begin(); it != bars.end();) {
-    if ((*it)->output->monitor == monitor) {
+    // Do not dereference (*it)->output here: it can be stale if multiple deferred
+    // monitor-removal callbacks are queued during output churn, e.g. suspend/resume.
+    if (isOutputPendingRemoval((*it)->output, outputs_pending_removal)) {
       auto output_name = (*it)->output->name;
       (*it)->window.hide();
       gtk_app->remove_window((*it)->window);
