@@ -17,6 +17,7 @@ test_src = files(
     'command.cpp',
     'css_reload_helper.cpp',
     '../../src/util/css_reload_helper.cpp',
+    'output.cpp',
 )
 
 if tz_dep.found()

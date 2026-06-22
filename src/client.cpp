@@ -11,6 +11,7 @@
 #include "util/clara.hpp"
 #include "util/format.hpp"
 #include "util/hex_checker.hpp"
+#include "util/output.hpp"
 
 waybar::Client* waybar::Client::inst() {
   static auto* c = new Client();
@@ -91,16 +92,38 @@ void waybar::Client::handleOutputDone(void* data, struct zxdg_output_v1* /*xdg_o
       output.xdg_output.reset();
       spdlog::debug("Output detection done: {} ({})", output.name, output.identifier);
 
-      auto configs = client->getOutputConfigs(output);
-      if (!configs.empty()) {
-        for (const auto& config : configs) {
-          client->bars.emplace_back(std::make_unique<Bar>(&output, config));
-        }
+      client->pending_outputs_.push_back(&output);
+
+      if (!client->bars_scheduled_) {
+        client->bars_scheduled_ = true;
+
+        Glib::signal_idle().connect_once([client]() {
+          client->createBarsBatch();
+        }, Glib::PRIORITY_HIGH_IDLE);
       }
     }
   } catch (const std::exception& e) {
     spdlog::warn("caught exception in zxdg_output_v1_listener::done: {}", e.what());
   }
+}
+
+void waybar::Client::createBarsBatch() {
+  pending_outputs_.remove_if([this](auto* output) { return std::none_of(outputs_.begin(), outputs_.end(), [&output](const auto& o) { return &o == output; }); });
+  for (auto* output : pending_outputs_) {
+    try {
+      auto configs = getOutputConfigs(*output);
+      if (!configs.empty()) {
+        for (const auto& config : configs) {
+          bars.emplace_back(std::make_unique<Bar>(output, config));
+        }
+      }
+    } catch (const std::exception& e) {
+      spdlog::warn("Error creating bar: {}", e.what());
+    }
+  }
+
+  pending_outputs_.clear();
+  bars_scheduled_ = false;
 }
 
 void waybar::Client::handleOutputName(void* data, struct zxdg_output_v1* /*xdg_output*/,
@@ -148,8 +171,17 @@ void waybar::Client::handleMonitorRemoved(Glib::RefPtr<Gdk::Monitor> monitor) {
 }
 
 void waybar::Client::handleDeferredMonitorRemoval(Glib::RefPtr<Gdk::Monitor> monitor) {
+  std::vector<waybar_output*> outputs_pending_removal;
+  for (auto& output : outputs_) {
+    if (output.monitor == monitor) {
+      outputs_pending_removal.push_back(&output);
+    }
+  }
+
   for (auto it = bars.begin(); it != bars.end();) {
-    if ((*it)->output->monitor == monitor) {
+    // Do not dereference (*it)->output here: it can be stale if multiple deferred
+    // monitor-removal callbacks are queued during output churn, e.g. suspend/resume.
+    if (isOutputPendingRemoval((*it)->output, outputs_pending_removal)) {
       auto output_name = (*it)->output->name;
       (*it)->window.hide();
       gtk_app->remove_window((*it)->window);
