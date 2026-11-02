@@ -1,0 +1,84 @@
+--- a/src/custom-shell-surface.c
++++ b/src/custom-shell-surface.c
+@@ -88,7 +88,10 @@
+     gint64 start_time_micro = g_get_monotonic_time();
+     while (self->awaiting_initial_configure) {
+         wl_display_roundtrip (display);
+-        if (g_get_monotonic_time () > start_time_micro + 1000000) {
++        // A roundtrip may dispatch slow application callbacks as well as the configure.
++        // Only time out if we are still waiting after those callbacks have returned.
++        if (self->awaiting_initial_configure &&
++            g_get_monotonic_time () > start_time_micro + 1000000) {
+             g_warning ("Timed out waiting for initial .configure");
+             gtk_widget_unmap (GTK_WIDGET (widget));
+             break;
+--- a/test/integration-tests/meson.build
++++ b/test/integration-tests/meson.build
+@@ -34,6 +34,7 @@
+     'test-set-monitor',
+     'test-create-subsurface',
+     'test-configure-delay',
++    'test-configure-slow-roundtrip',
+     'test-nested-popup-configure-delay',
+     'test-only-output-removed',
+     'test-respect-close',
+--- /dev/null
++++ b/test/integration-tests/test-configure-slow-roundtrip.c
+@@ -0,0 +1,57 @@
++/* This entire file is licensed under MIT
++ *
++ * Copyright 2020 Sophie Winter
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "integration-test-common.h"
++#include <wayland-client.h>
++
++static gboolean slow_callback_ran;
++
++static void slow_done(void *data, struct wl_callback *callback, uint32_t serial)
++{
++    (void)data;
++    (void)serial;
++    wl_callback_destroy(callback);
++    slow_callback_ran = TRUE;
++    // Simulate a slow application callback dispatched by the initial configure roundtrip.
++    g_usleep(1200000);
++}
++
++static const struct wl_callback_listener slow_listener = {
++    .done = slow_done,
++};
++
++static void queue_slow_callback(GtkWidget *widget, gpointer data)
++{
++    (void)widget;
++    (void)data;
++    struct wl_display *display = gdk_wayland_display_get_wl_display(gdk_display_get_default());
++    struct wl_callback *callback = wl_display_sync(display);
++    wl_callback_add_listener(callback, &slow_listener, NULL);
++}
++
++static void callback_0(void)
++{
++    EXPECT_MESSAGE(zwlr_layer_surface_v1 .configure);
++
++    GtkWindow *window = create_default_window();
++    // Queue the slow callback immediately before layer-shell starts its configure wait.
++    g_signal_connect(window, "map", G_CALLBACK(queue_slow_callback), NULL);
++    gtk_layer_init_for_window(window);
++    gtk_widget_show_all(GTK_WIDGET(window));
++
++    g_assert_true(slow_callback_ran);
++    // Receiving configure during a slow roundtrip must not unmap the window.
++    g_assert_true(gtk_widget_get_mapped(GTK_WIDGET(window)));
++}
++
++TEST_CALLBACKS(
++    callback_0,
++)
