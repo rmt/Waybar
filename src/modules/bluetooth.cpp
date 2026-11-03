@@ -7,12 +7,14 @@
 #include <sstream>
 
 #include "util/scope_guard.hpp"
+#include "util/trace.hpp"
 
 namespace {
 
 using GDBusManager = std::unique_ptr<GDBusObjectManager, void (*)(GDBusObjectManager*)>;
 
 auto generateManager() -> GDBusManager {
+  waybar::util::ScopedTrace trace("Bluetooth system bus manager creation (sync)");
   GError* error = nullptr;
   waybar::util::ScopeGuard error_deleter([error]() {
     if (error) {
@@ -113,6 +115,8 @@ auto configUsesPeripheralBattery(const Json::Value& config) -> bool {
 }
 
 auto readBatteryCharacteristicValue(GDBusProxy* proxy_char) -> std::optional<unsigned char> {
+  waybar::util::ScopedTrace trace("Bluetooth ReadValue (sync, timeout=2000ms) path={}",
+                                  g_dbus_proxy_get_object_path(proxy_char));
   GVariantBuilder builder;
   g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
 

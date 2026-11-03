@@ -14,6 +14,7 @@
 #include "util/format.hpp"
 #include "util/hex_checker.hpp"
 #include "util/output.hpp"
+#include "util/trace.hpp"
 #ifdef HAVE_BAR_BLUR
 #include "ext-background-effect-v1-client-protocol.h"
 #endif
@@ -112,6 +113,7 @@ void waybar::Client::handleOutputDone(void* data, struct zxdg_output_v1* /*xdg_o
   auto* client = waybar::Client::inst();
   try {
     auto& output = client->getOutput(data);
+    util::ScopedTrace trace("Client::handleOutputDone output={}", output.name);
     /**
      * Multiple .done events may arrive in batch. In this case libwayland would queue
      * xdg_output.destroy and dispatch all pending events, triggering this callback several times
@@ -141,12 +143,15 @@ void waybar::Client::handleOutputDone(void* data, struct zxdg_output_v1* /*xdg_o
 }
 
 void waybar::Client::createBarsBatch() {
+  util::ScopedTrace trace("Client::createBarsBatch pending_outputs={}", pending_outputs_.size());
   pending_outputs_.remove_if([this](auto* output) { return std::none_of(outputs_.begin(), outputs_.end(), [&output](const auto& o) { return &o == output; }); });
   for (auto* output : pending_outputs_) {
     try {
       auto configs = getOutputConfigs(*output);
       if (!configs.empty()) {
         for (const auto& config : configs) {
+          util::ScopedTrace bar_trace("Bar construction output={} name={}", output->name,
+                                      config["name"].asString());
           bars.emplace_back(std::make_unique<Bar>(output, config));
         }
       }
@@ -186,6 +191,7 @@ void waybar::Client::handleOutputDescription(void* data, struct zxdg_output_v1* 
 }
 
 void waybar::Client::handleMonitorAdded(Glib::RefPtr<Gdk::Monitor> monitor) {
+  util::ScopedTrace trace("Client::handleMonitorAdded");
   auto& output = outputs_.emplace_back();
   output.monitor = std::move(monitor);
   handleOutput(output);
@@ -204,6 +210,7 @@ void waybar::Client::handleMonitorRemoved(Glib::RefPtr<Gdk::Monitor> monitor) {
 }
 
 void waybar::Client::handleDeferredMonitorRemoval(Glib::RefPtr<Gdk::Monitor> monitor) {
+  util::ScopedTrace trace("Client::handleDeferredMonitorRemoval");
   std::vector<waybar_output*> outputs_pending_removal;
   for (auto& output : outputs_) {
     if (output.monitor == monitor) {
@@ -261,6 +268,7 @@ const std::string waybar::Client::getStyle(const std::string& style,
 };
 
 auto waybar::Client::setupCss(const std::string& css_file) -> void {
+  util::ScopedTrace trace("Client::setupCss");
   auto screen = Gdk::Screen::get_default();
   if (!screen) {
     throw std::runtime_error("No default screen");
@@ -292,13 +300,17 @@ auto waybar::Client::setupCss(const std::string& css_file) -> void {
 }
 
 void waybar::Client::bindInterfaces() {
+  util::ScopedTrace trace("Client::bindInterfaces");
   registry = wl_display_get_registry(wl_display);
   static const struct wl_registry_listener registry_listener = {
       .global = handleGlobal,
       .global_remove = handleGlobalRemove,
   };
   wl_registry_add_listener(registry, &registry_listener, this);
-  wl_display_roundtrip(wl_display);
+  {
+    util::ScopedTrace roundtrip_trace("Client::bindInterfaces registry roundtrip");
+    wl_display_roundtrip(wl_display);
+  }
 
   if (gtk_layer_is_supported() == 0) {
     throw std::runtime_error("The Wayland compositor does not support wlr-layer-shell protocol");
@@ -365,8 +377,18 @@ int waybar::Client::main(int argc, char* argv[]) {
   if (!log_level.empty()) {
     spdlog::set_level(spdlog::level::from_str(log_level));
   }
-  gtk_app = Gtk::Application::create(argc, argv, "fr.arouillard.waybar",
-                                     Gio::APPLICATION_HANDLES_COMMAND_LINE);
+  if (spdlog::should_log(spdlog::level::trace)) {
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [thread %t] %v");
+    spdlog::flush_on(spdlog::level::trace);
+    spdlog::trace("[timing] runtime GTK {}.{}.{} gtk-layer-shell {}.{}.{}", gtk_get_major_version(),
+                  gtk_get_minor_version(), gtk_get_micro_version(), gtk_layer_get_major_version(),
+                  gtk_layer_get_minor_version(), gtk_layer_get_micro_version());
+  }
+  {
+    util::ScopedTrace trace("Gtk::Application::create");
+    gtk_app = Gtk::Application::create(argc, argv, "fr.arouillard.waybar",
+                                       Gio::APPLICATION_HANDLES_COMMAND_LINE);
+  }
 
   // Initialize Waybars GTK resources with our custom icons
   auto theme = Gtk::IconTheme::get_default();
@@ -380,8 +402,12 @@ int waybar::Client::main(int argc, char* argv[]) {
     throw std::runtime_error("Bar need to run under Wayland");
   }
   wl_display = gdk_wayland_display_get_wl_display(gdk_display->gobj());
-  config.load(config_opt);
+  {
+    util::ScopedTrace trace("Config::load");
+    config.load(config_opt);
+  }
   if (!portal) {
+    util::ScopedTrace trace("Portal construction");
     try {
       portal = std::make_unique<waybar::Portal>();
     } catch (const Glib::Error& e) {
@@ -417,7 +443,9 @@ int waybar::Client::main(int argc, char* argv[]) {
 
   bindInterfaces();
   gtk_app->hold();
+  spdlog::trace("[timing] entering GTK main loop");
   gtk_app->run();
+  spdlog::trace("[timing] GTK main loop returned");
   m_cssReloadHelper.reset();  // stop watching css file
   bars.clear();
   return 0;

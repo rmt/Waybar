@@ -37,6 +37,7 @@ class Item : public sigc::trackable {
   ~Item();
 
   bool isReady() const;
+  const std::string& customIcon() const { return custom_icon_; }
 
   std::string bus_name;
   std::string object_path;
@@ -87,14 +88,8 @@ class Item : public sigc::trackable {
 
   void updateImage();
   static Glib::RefPtr<Gdk::Pixbuf> extractPixBuf(GVariant* variant);
-  Glib::RefPtr<Gdk::Pixbuf> getIconPixbuf();
-  Glib::RefPtr<Gdk::Pixbuf> getAttentionIconPixbuf();
-  Glib::RefPtr<Gdk::Pixbuf> getOverlayIconPixbuf();
-  Glib::RefPtr<Gdk::Pixbuf> loadIconFromNameOrFile(const std::string& name, bool log_failure);
   static Glib::RefPtr<Gdk::Pixbuf> overlayPixbufs(const Glib::RefPtr<Gdk::Pixbuf>&,
                                                   const Glib::RefPtr<Gdk::Pixbuf>&);
-  Glib::RefPtr<Gdk::Pixbuf> getIconByName(const std::string& name, int size);
-  double getScaledIconSize();
   static void onMenuDestroyed(Item* self, GObject* old_menu_pointer);
   void makeMenu();
   bool hasMenuLayout() const;
@@ -113,6 +108,7 @@ class Item : public sigc::trackable {
   // hidden via config
   bool is_hidden_ = false;
   bool ready_ = false;
+  bool destroying_ = false;
   Glib::ustring status_ = "active";
 
   const Bar& bar_;
@@ -122,6 +118,10 @@ class Item : public sigc::trackable {
 
   Glib::RefPtr<Gio::DBus::Proxy> proxy_;
   Glib::RefPtr<Gio::Cancellable> cancellable_;
+  Glib::RefPtr<Gio::Cancellable> image_cancellable_;
+  int requested_icon_size_ = 0;
+  int requested_icon_scale_ = 0;
+  std::string custom_icon_;
   std::set<std::string_view> update_pending_;
 
   Host& host_;

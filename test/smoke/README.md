@@ -19,6 +19,8 @@ AddressSanitizer** and runs the real binary inside a **headless** compositor
 | 3 | **Layout matrix** — top / bottom / left (vertical) + HiDPI (scale 2) | [`positions.sh`](positions.sh) |
 | 3 | **Second compositor** — same launch under `labwc` | workflow (`COMPOSITOR=labwc`) |
 | 4 | **Lifecycle / teardown** — clean SIGINT exit, runtime **output hotplug**, toggle + reload churn, fast-interval teardown (the C++ destructor path a `kill` never runs, #5182) | [`lifecycle.sh`](lifecycle.sh) |
+| 4 | **Taskbar startup** — inject a two-second worker lookup; require UI responsiveness, first-draw gating, no placeholder searches, safe cancellation/reload/early exit, UI-only GTK operations | [`taskbar-startup.sh`](taskbar-startup.sh) (standalone) |
+| 4 | **Tray icons** — real SNI fixture with pixel assertions for attention/overlay/symbolic/custom/pixmap icons, HiDPI, reload and removal | [`tray-icons.sh`](tray-icons.sh) (standalone) |
 | 4 | **Custom-backend fuzz** — empty / non-zero-exit / invalid-JSON / huge / non-UTF8 / empty-format exec output | [`fuzz.sh`](fuzz.sh) |
 | 5 | **State transitions** *(best-effort)* — real `mpd` driven through an **empty queue** (#5183) + stop/clear, `pulseaudio` + slider on a null sink | [`state.sh`](state.sh) |
 | 6 | **Fake hardware** *(best-effort)* — `backlight`, `backlight/slider` (#5179) and `battery` via **umockdev** | [`hardware.sh`](hardware.sh) |
@@ -62,6 +64,9 @@ export WAYBAR_BIN=$PWD/build/waybar
 ./test/smoke/interact.sh  /tmp/interaction-shots
 ./test/smoke/positions.sh /tmp/layout-shots
 dbus-run-session -- ./test/smoke/a11y.sh
+# Taskbar regression needs Python GTK3 and a C compiler; creates a private D-Bus session.
+bash ./test/smoke/taskbar-startup.sh
+bash ./test/smoke/tray-icons.sh
 # best-effort (need extra daemons / tools):
 ./test/smoke/state.sh                        # needs mpd + mpc, pulseaudio
 ./test/smoke/hardware.sh                     # needs umockdev

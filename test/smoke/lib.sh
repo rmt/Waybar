@@ -10,7 +10,7 @@
 #   smoke::screenshot out.png
 #   smoke::stop
 #
-# Environment knobs (optional): WIDTH HEIGHT SCALE COMPOSITOR WAYBAR_BIN
+# Environment knobs (optional): WIDTH HEIGHT SCALE COMPOSITOR WAYBAR_BIN SWAY_BIN
 set -uo pipefail
 
 WIDTH="${WIDTH:-1920}"
@@ -48,7 +48,7 @@ smoke::start_compositor() {
             cat > "$cfg" <<EOF
 output HEADLESS-1 resolution ${WIDTH}x${HEIGHT} scale ${SCALE} background #000000 solid_color
 EOF
-            sway -c "$cfg" >/tmp/compositor.log 2>&1 &
+            "${SWAY_BIN:-sway}" -c "$cfg" >/tmp/compositor.log 2>&1 &
             COMP_PID=$!
             ;;
         labwc)

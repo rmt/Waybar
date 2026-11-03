@@ -13,6 +13,7 @@
 #include "util/enum.hpp"
 #include "util/hosts_check.hpp"
 #include "util/kill_signal.hpp"
+#include "util/trace.hpp"
 
 #ifdef HAVE_SWAY
 #include "modules/sway/bar.hpp"
@@ -280,11 +281,15 @@ waybar::Bar::Bar(struct waybar_output* w_output, const Json::Value& w_config)
   window.signal_map_event().connect_notify(sigc::mem_fun(*this, &Bar::onMap));
 
   unmap_conn_ = window.signal_unmap().connect([this]() {
+    util::ScopedTrace trace("Bar unmap callback output={}", output->name);
+    traceWindowState("unmap signal");
     spdlog::debug("Output {} unmapped, suspending modules", output->name);
     toggleSuspend(true);
   });
 
   map_conn_ = window.signal_map().connect([this]() {
+    util::ScopedTrace trace("Bar map callback output={}", output->name);
+    traceWindowState("map signal");
     spdlog::debug("Output {} mapped, resuming modules", output->name);
     toggleSuspend(false);
   });
@@ -332,7 +337,11 @@ waybar::Bar::Bar(struct waybar_output* w_output, const Json::Value& w_config)
   }
 
   setupWidgets();
-  window.show_all();
+  {
+    util::ScopedTrace trace("Bar::window.show_all output={}", output->name);
+    window.show_all();
+    traceWindowState("show_all returned");
+  }
 
   /*
    * If gtk-layer-shell's synchronous wait for the initial configure timed out, show_all() can
@@ -342,9 +351,11 @@ waybar::Bar::Bar(struct waybar_output* w_output, const Json::Value& w_config)
    */
   Glib::signal_idle().connect(sigc::track_obj(
       [this] {
+        util::ScopedTrace trace("Bar post-show idle callback output={}", output->name);
         window.queue_resize();
         window.queue_draw();
         forceLayerCommit();
+        traceWindowState("post-show idle");
         return false;
       },
       *this));
@@ -436,6 +447,18 @@ void waybar::Bar::forceLayerCommit() {
   wl_display_flush(Client::inst()->wl_display);
 }
 
+void waybar::Bar::traceWindowState(const char* phase) {
+  if (!spdlog::should_log(spdlog::level::trace)) {
+    return;
+  }
+  spdlog::trace(
+      "[timing] window {} output={} name={} visible={} mapped={} realized={} mode={} opacity={} "
+      "size={}x{}",
+      phase, output->name, config["name"].asString(), window.get_visible(), window.get_mapped(),
+      window.get_realized(), last_mode_, window.get_opacity(), window.get_width(),
+      window.get_height());
+}
+
 void waybar::Bar::setPassThrough(bool passthrough) {
   auto gdk_window = window.get_window();
   if (gdk_window) {
@@ -489,6 +512,8 @@ void waybar::Bar::setPosition(Gtk::PositionType position) {
 }
 
 void waybar::Bar::onMap(GdkEventAny* /*unused*/) {
+  util::ScopedTrace trace("Bar::onMap event output={}", output->name);
+  traceWindowState("map event");
   /*
    * Obtain a pointer to the custom layer surface for modules that require it (idle_inhibitor).
    */
@@ -677,6 +702,8 @@ void waybar::Bar::getModules(const Factory& factory, const std::string& pos,
     for (const auto& name : module_list) {
       try {
         auto ref = name.asString();
+        util::ScopedTrace module_trace("Module setup {} output={} position={}", ref, output->name,
+                                       pos);
 
         if (config[ref].isMember("hosts") && !waybar::util::valid_host(config[ref])) {
           continue;
@@ -720,7 +747,8 @@ void waybar::Bar::getModules(const Factory& factory, const std::string& pos,
             modules_right_.emplace_back(module_sp);
           }
         }
-        module->dp.connect([module, ref] {
+        module->dp.connect([module, ref, output_name = output->name] {
+          util::ScopedTrace update_trace("Module update {} output={}", ref, output_name);
           try {
             module->update();
           } catch (const std::exception& e) {
@@ -736,6 +764,7 @@ void waybar::Bar::getModules(const Factory& factory, const std::string& pos,
 }
 
 auto waybar::Bar::setupWidgets() -> void {
+  util::ScopedTrace trace("Bar::setupWidgets output={}", output->name);
   window.add(box_);
 
   bool expand_left = config["expand-left"].isBool() ? config["expand-left"].asBool() : false;
@@ -782,6 +811,9 @@ auto waybar::Bar::setupWidgets() -> void {
 }
 
 void waybar::Bar::onConfigure(GdkEventConfigure* ev) {
+  util::ScopedTrace trace("Bar::onConfigure output={} size={}x{}", output->name, ev->width,
+                          ev->height);
+  traceWindowState("configure event");
   /*
    * GTK wants new size for the window.
    * Actual resizing and management of the exclusve zone is handled within the gtk-layer-shell

@@ -8,6 +8,7 @@
 #include <string>
 
 #include "fmt/format.h"
+#include "util/trace.hpp"
 
 namespace waybar {
 static constexpr const char* PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop";
@@ -49,6 +50,7 @@ waybar::Portal::Portal()
 };
 
 void waybar::Portal::refreshAppearance() {
+  util::ScopedTrace trace("Portal::refreshAppearance");
   if (get_name_owner().empty()) {
     // Nothing is serving the portal yet; the g-name-owner handler will call us
     // back if something does.
@@ -62,6 +64,7 @@ void waybar::Portal::refreshAppearance() {
 }
 
 void waybar::Portal::onAppearanceReceived(Glib::RefPtr<Gio::AsyncResult>& result) {
+  util::ScopedTrace trace("Portal::onAppearanceReceived");
   Glib::VariantBase response;
   try {
     response = call_finish(result);

@@ -23,6 +23,8 @@ test_src = files(
     '../../src/util/css_reload_helper.cpp',
     '../../src/util/command_line_stream.cpp',
     'output.cpp',
+    'trace.cpp',
+    'async.cpp',
 )
 
 if libnl.found() and libnlgen.found()
