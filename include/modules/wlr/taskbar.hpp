@@ -1,12 +1,14 @@
 #pragma once
 
 #include <gdk/gdk.h>
+#include <giomm/cancellable.h>
 #include <glibmm/refptr.h>
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
 #include <gtkmm/icontheme.h>
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
+#include <sigc++/connection.h>
 #include <wayland-client.h>
 
 #include <map>
@@ -52,6 +54,7 @@ class Task {
   struct widget_geometry minimize_hint;
 
  private:
+  friend class Taskbar;
   static uint32_t global_id;
 
  private:
@@ -68,6 +71,10 @@ class Task {
   Gtk::Label text_before_;
   Gtk::Label text_after_;
   Glib::RefPtr<Gio::DesktopAppInfo> app_info_;
+  Glib::RefPtr<Gio::Cancellable> metadata_cancellable_;
+  Glib::RefPtr<Gio::Cancellable> icon_cancellable_;
+  bool app_info_dirty_ = false;
+  bool icon_dirty_ = false;
   bool button_visible_ = false;
   bool ignored_ = false;
   bool squashed_ = false;
@@ -102,6 +109,8 @@ class Task {
   void hide_if_duplicate();
   void show_button();
   void hide_button();
+  void refresh_metadata();
+  void cancel_metadata_lookup();
 
  public:
   /* Getter functions */
@@ -172,6 +181,10 @@ class Taskbar : public waybar::AModule {
   std::vector<TaskPtr> tasks_;
 
   IconLoader icon_loader_;
+  // Lookup work must not run in Wayland callbacks dispatched by the initial map roundtrip.
+  bool metadata_ready_ = false;
+  sigc::connection metadata_draw_connection_;
+  sigc::connection metadata_idle_connection_;
   std::unordered_set<std::string> ignore_list_;
   std::unordered_set<std::string> squash_list_;
   std::map<std::string, std::string> app_ids_replace_map_;
@@ -207,6 +220,7 @@ class Taskbar : public waybar::AModule {
   void remove_task(uint32_t);
   void assign_current_workspace(Task&);
   void update_bar_css_classes();
+  void schedule_metadata_update();
 
   bool show_output(struct wl_output*) const;
   bool all_outputs() const;
@@ -223,6 +237,7 @@ class Taskbar : public waybar::AModule {
   }
 
  private:
+  bool dispatch_metadata_update();
   void set_bar_css_class(const std::string&, bool);
 };
 

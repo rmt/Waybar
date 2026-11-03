@@ -78,6 +78,7 @@ void Host::checkIgnoreList(const std::vector<std::string>& ignore_list,
       if (item->bus_name.find(ignored) != std::string::npos ||
           item->category.find(ignored) != std::string::npos ||
           item->icon_name.find(ignored) != std::string::npos ||
+          item->customIcon().find(ignored) != std::string::npos ||
           item->id.find(ignored) != std::string::npos ||
           item->title.find(ignored) != std::string::npos) {
         spdlog::info(
