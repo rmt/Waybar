@@ -201,6 +201,7 @@ src_files = files(
     'src/util/rewrite_string.cpp',
     'src/util/hosts_check.cpp',
     'src/util/gtk_icon.cpp',
+    'src/util/async_icon.cpp',
     'src/util/icon_loader.cpp',
     'src/util/regex_collection.cpp',
     'src/util/css_reload_helper.cpp',

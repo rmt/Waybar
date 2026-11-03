@@ -4,6 +4,7 @@
 #include <gdkmm/monitor.h>
 #include <gio/gdesktopappinfo.h>
 #include <giomm/desktopappinfo.h>
+#include <glibmm/main.h>
 #include <gtkmm/icontheme.h>
 #include <spdlog/spdlog.h>
 
@@ -20,6 +21,7 @@
 #include "glibmm/fileutils.h"
 #include "glibmm/refptr.h"
 #include "modules/wlr/taskbar_dnd.hpp"
+#include "util/async.hpp"
 #include "util/format.hpp"
 #include "util/gtk_icon.hpp"
 #include "util/rewrite_string.hpp"
@@ -172,9 +174,8 @@ Task::Task(const waybar::Bar& bar, const Json::Value& config, Taskbar* tbar,
     with_icon_ = true;
   }
 
-  if (app_id_.empty()) {
-    handle_app_id("unknown");
-  }
+  // Wait for the compositor's real app ID/title. Resolving a synthetic "unknown" here
+  // can trigger a cold desktop-file scan inside gtk-layer-shell's initial configure wait.
 
   /* Strip spaces at the beginning and end of the format strings */
   format_tooltip_.clear();
@@ -207,13 +208,18 @@ Task::Task(const waybar::Bar& bar, const Json::Value& config, Taskbar* tbar,
    * than the one GTK guessed while the widget was not yet realized. */
   icon_.property_scale_factor().signal_changed().connect([this] {
     if (!with_icon_) return;
-    int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
-    spdlog::debug("Task ({}) scale factor changed, reloading icon", id_);
-    if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size)) icon_.show();
+    spdlog::debug("Task ({}) scale factor changed, scheduling icon reload", id_);
+    if (icon_cancellable_) {
+      icon_cancellable_->cancel();
+      icon_cancellable_.reset();
+    }
+    icon_dirty_ = true;
+    tbar_->schedule_metadata_update();
   });
 }
 
 Task::~Task() {
+  cancel_metadata_lookup();
   if (handle_) {
     zwlr_foreign_toplevel_handle_v1_destroy(handle_);
     handle_ = nullptr;
@@ -254,13 +260,21 @@ void Task::handle_title(const char* title) {
   } else {
     spdlog::debug(fmt::format("Task ({}) overwriting title '{}' with '{}'", id_, title_, title));
   }
+  const bool title_changed = title_ != title;
   title_ = title;
   hide_if_ignored();
   hide_if_duplicate();
   update_duplicates();
 
   if (with_icon_ || with_name_) {
-    title_lookup_pending_ = true;
+    name_ = app_id_.empty() ? title_ : app_id_;
+    if (title_changed && (app_id_.empty() || !app_info_)) {
+      cancel_metadata_lookup();
+      app_info_.reset();
+      app_info_dirty_ = true;
+      icon_dirty_ = with_icon_;
+      tbar_->schedule_metadata_update();
+    }
   }
 }
 
@@ -334,43 +348,90 @@ void Task::handle_app_id(const char* app_id) {
     return;
   }
 
-  name_ = app_id;
-  app_id_lookup_pending_ = true;
-  title_lookup_pending_ = false;
+  cancel_metadata_lookup();
+  app_info_.reset();
+  name_ = app_id_.empty() ? title_ : app_id_;
+  app_info_dirty_ = true;
+  icon_dirty_ = with_icon_;
+  tbar_->schedule_metadata_update();
 }
 
-// Lookups cost file probes and an index search, and clients choose how often their app_id and
-// title change: they run from update(), once per batch of events, and never twice for one string
-void Task::lookup_app_info() {
-  bool looked_up = false;
-  if (app_id_lookup_pending_) {
-    app_id_lookup_pending_ = false;
-    lookup_source_ = app_id_;
-    looked_up = true;
-    app_info_ = IconLoader::get_app_info_from_app_id_list(app_id_);
-    if (app_info_) {
-      name_ = app_info_->get_display_name();
-    }
+void Task::cancel_metadata_lookup() {
+  if (metadata_cancellable_) {
+    metadata_cancellable_->cancel();
+    metadata_cancellable_.reset();
   }
-  if (title_lookup_pending_) {
-    title_lookup_pending_ = false;
-    if (!app_info_ && title_ != lookup_source_) {
-      lookup_source_ = title_;
-      looked_up = true;
-      app_info_ = IconLoader::get_app_info_from_app_id_list(title_);
-      name_ = app_info_ ? app_info_->get_display_name() : title_;
-    }
+  if (icon_cancellable_) {
+    icon_cancellable_->cancel();
+    icon_cancellable_.reset();
   }
+}
 
-  if (!looked_up || !with_icon_) {
+void Task::refresh_metadata() {
+  if (std::exchange(app_info_dirty_, false)) {
+    cancel_metadata_lookup();
+    lookup_source_ = app_id_.empty() ? title_ : app_id_;
+    auto cancellable = Gio::Cancellable::create();
+    metadata_cancellable_ = cancellable;
+    using AppInfo = Glib::RefPtr<Gio::DesktopAppInfo>;
+    util::runAsync<AppInfo>(
+        cancellable,
+        [app_id = app_id_, title = title_](GCancellable* cancelled) {
+          // Only immutable copies and GIO objects cross threads; no Task/GTK objects here.
+          AppInfo info;
+          if (!app_id.empty()) {
+            info = IconLoader::get_app_info_from_app_id_list(app_id, cancelled);
+          }
+          if (!info && !title.empty() && !g_cancellable_is_cancelled(cancelled)) {
+            info = IconLoader::get_app_info_from_app_id_list(title, cancelled);
+          }
+          return info;
+        },
+        [this, cancellable](std::optional<AppInfo> info, std::string error) {
+          // runAsync suppresses this callback after cancellation, including Task destruction.
+          // An identity check also prevents an obsolete request from replacing newer metadata.
+          if (metadata_cancellable_ != cancellable) {
+            return;
+          }
+          metadata_cancellable_.reset();
+          if (!error.empty()) {
+            spdlog::warn("Taskbar desktop lookup failed: {}", error);
+          }
+          app_info_ = info.value_or(AppInfo{});
+          name_ = app_info_ ? app_info_->get_display_name() : (app_id_.empty() ? title_ : app_id_);
+          icon_dirty_ = with_icon_;
+          tbar_->dp.emit();
+          tbar_->schedule_metadata_update();
+        });
     return;
   }
 
-  int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
-  if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size))
-    icon_.show();
-  else
-    spdlog::debug("Couldn't find icon for {}", lookup_source_);
+  if (!metadata_cancellable_ && std::exchange(icon_dirty_, false) && with_icon_) {
+    int icon_size = std::max(1, config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16);
+    if (icon_cancellable_) icon_cancellable_->cancel();
+    auto cancellable = Gio::Cancellable::create();
+    icon_cancellable_ = cancellable;
+    const int scale = icon_.get_scale_factor();
+    tbar_->icon_loader().load_icon_async(
+        app_info_, icon_size, scale, cancellable,
+        [this, cancellable, icon_size, scale](Glib::RefPtr<Gdk::Pixbuf> pixbuf) {
+          if (icon_cancellable_ != cancellable) return;
+          icon_cancellable_.reset();
+          if (!pixbuf) {
+            spdlog::debug("Couldn't find icon for {}", app_id_);
+            return;
+          }
+          const int pixels = icon_size * scale;
+          if (pixbuf->get_width() != pixels && pixbuf->get_height() > 0) {
+            const int width = std::max(1, pixels * pixbuf->get_width() / pixbuf->get_height());
+            pixbuf = pixbuf->scale_simple(width, pixels, Gdk::INTERP_BILINEAR);
+          }
+          auto surface = Gdk::Cairo::create_surface_from_pixbuf(pixbuf, scale, icon_.get_window());
+          icon_.set(surface);
+          icon_.show();
+        });
+  }
+  tbar_->dp.emit();
 }
 
 void Task::on_button_size_allocated(Gtk::Allocation& alloc) {
@@ -606,9 +667,6 @@ bool Task::operator==(const Task& o) const { return o.id_ == id_; }
 bool Task::operator!=(const Task& o) const { return o.id_ != id_; }
 
 void Task::update() {
-  if (app_id_lookup_pending_ || title_lookup_pending_) {
-    lookup_app_info();
-  }
 
   bool markup = config_["markup"].isBool() ? config_["markup"].asBool() : false;
   std::string title = toSingleLine(title_);
@@ -800,11 +858,30 @@ Taskbar::Taskbar(const std::string& id, const waybar::Bar& bar, const Json::Valu
   }
 
   for (auto& t : tasks_) {
-    t->handle_app_id(t->app_id().c_str());
+    if (!t->app_id().empty()) {
+      t->handle_app_id(t->app_id().c_str());
+    }
   }
+
+  // An idle alone is not a readiness barrier if GTK enters a nested main loop while
+  // mapping. Wait for the first draw, then run lookup work at normal idle priority.
+  auto& window = const_cast<Bar&>(bar_).window;
+  metadata_draw_connection_ =
+      window.signal_draw().connect([this](const Cairo::RefPtr<Cairo::Context>&) {
+        metadata_draw_connection_.disconnect();
+        metadata_ready_ = true;
+        schedule_metadata_update();
+        return false;
+      });
 }
 
 Taskbar::~Taskbar() {
+  metadata_ready_ = false;
+  metadata_draw_connection_.disconnect();
+  metadata_idle_connection_.disconnect();
+  for (auto& task : tasks_) {
+    task->cancel_metadata_lookup();
+  }
   if (workspace_manager_) {
     struct wl_display* display = Client::inst()->wl_display;
     ext_workspace_manager_v1_stop(workspace_manager_);
@@ -851,6 +928,40 @@ Taskbar::~Taskbar() {
     set_bar_css_class("toplevel-minimized", false);
     set_bar_css_class("toplevel-fullscreen", false);
   }
+}
+
+void Taskbar::schedule_metadata_update() {
+  if (!metadata_ready_ || metadata_idle_connection_.connected()) {
+    return;
+  }
+  metadata_idle_connection_ =
+      Glib::signal_idle().connect(sigc::mem_fun(*this, &Taskbar::dispatch_metadata_update));
+}
+
+bool Taskbar::dispatch_metadata_update() {
+  // Bound work submitted to GIO's pool; icon/widget updates stay on this UI thread.
+  // Keep no queued Task pointers: a closed task can be destroyed before this source runs.
+  const auto in_flight = std::count_if(tasks_.begin(), tasks_.end(), [](const auto& task) {
+    return static_cast<bool>(task->metadata_cancellable_);
+  });
+  const auto pending = [in_flight](const auto& task) {
+    return (task->app_info_dirty_ && in_flight < 2) ||
+           (!task->app_info_dirty_ && task->icon_dirty_ && !task->metadata_cancellable_);
+  };
+  auto task = std::find_if(tasks_.begin(), tasks_.end(), pending);
+  if (task == tasks_.end()) {
+    return false;
+  }
+  try {
+    (*task)->refresh_metadata();
+  } catch (const Glib::Error& e) {
+    spdlog::warn("Taskbar metadata lookup failed: {}", e.what());
+  } catch (const std::exception& e) {
+    spdlog::warn("Taskbar metadata lookup failed: {}", e.what());
+  }
+  // A lookup completion will schedule another idle once a worker slot becomes available.
+  // Re-evaluate eligibility on the next dispatch, including newly started/cancelled requests.
+  return true;
 }
 
 void Taskbar::update() {

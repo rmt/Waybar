@@ -25,6 +25,7 @@ test_src = files(
     '../../src/util/css_reload_helper.cpp',
     '../../src/util/command_line_stream.cpp',
     'output.cpp',
+    'async.cpp',
 )
 
 test_src += files('regex_collection.cpp', '../../src/util/regex_collection.cpp')
@@ -44,6 +45,7 @@ test_dep += giounix
 test_src += files(
     'icon_loader.cpp',
     '../../src/util/icon_loader.cpp',
+    '../../src/util/async_icon.cpp',
     '../../src/util/gtk_icon.cpp',
 )
 

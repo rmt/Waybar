@@ -15,6 +15,13 @@ bool DefaultGtkIconThemeWrapper::has_icon(const std::string& value) {
   return Gtk::IconTheme::get_default()->has_icon(value);
 }
 
+Gtk::IconInfo DefaultGtkIconThemeWrapper::lookup_icon(const Glib::RefPtr<const Gio::Icon>& icon,
+                                                      int size, int scale,
+                                                      Gtk::IconLookupFlags flags) {
+  const std::lock_guard<std::mutex> lock(default_theme_mutex);
+  return Gtk::IconTheme::get_default()->lookup_icon(icon, size, scale, flags);
+}
+
 Glib::RefPtr<Gdk::Pixbuf> DefaultGtkIconThemeWrapper::load_icon(
     const char* name, int tmp_size, Gtk::IconLookupFlags flags,
     Glib::RefPtr<Gtk::StyleContext> style) {
