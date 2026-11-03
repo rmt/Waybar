@@ -1,6 +1,9 @@
 #include "util/icon_loader.hpp"
 
+#include <giomm/themedicon.h>
+
 #include "util/string.hpp"
+#include "util/trace.hpp"
 
 std::vector<std::string> IconLoader::search_prefix() {
   std::vector<std::string> prefixes;
@@ -34,22 +37,28 @@ std::vector<std::string> IconLoader::search_prefix() {
   return prefixes;
 }
 
-Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_by_name(const std::string& app_id) {
-  static std::vector<std::string> prefixes = search_prefix();
-
+Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_by_name(
+    const std::string& app_id, const std::vector<std::string>& prefixes,
+    GCancellable* cancellable) {
   // App ids come from other clients: they name a desktop entry and are never a path
   if (app_id.empty() || app_id.find('/') != std::string::npos) {
     return {};
   }
+  waybar::util::ScopedTrace trace("IconLoader::get_app_info_by_name app_id={}", app_id);
 
-  std::vector<std::string> app_folders = {"", "applications/", "applications/kde/",
-                                          "applications/org.kde."};
 
-  std::vector<std::string> suffixes = {"", ".desktop"};
+  static constexpr const char* app_folders[] = {"", "applications/", "applications/kde/",
+                                                "applications/org.kde."};
+  static constexpr const char* suffixes[] = {"", ".desktop"};
 
   for (auto const& prefix : prefixes) {
+    waybar::util::ScopedTrace prefix_trace("Desktop-file candidates app_id={} prefix={}", app_id,
+                                           prefix);
     for (auto const& folder : app_folders) {
       for (auto const& suffix : suffixes) {
+        if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+          return {};
+        }
         auto app_info_ =
             Gio::DesktopAppInfo::create_from_filename(prefix + folder + app_id + suffix);
         if (!app_info_) {
@@ -64,19 +73,25 @@ Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_by_name(const std::st
   return {};
 }
 
-Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_desktop_app_info(const std::string& app_id,
-                                                                   guint& search_words_left) {
-  auto app_info = get_app_info_by_name(app_id);
+Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_desktop_app_info(
+    const std::string& app_id, const std::vector<std::string>& prefixes, guint& search_words_left,
+    GCancellable* cancellable) {
+  waybar::util::ScopedTrace trace("IconLoader::get_desktop_app_info app_id={}", app_id);
+  if (app_id.empty() || (cancellable && g_cancellable_is_cancelled(cancellable))) {
+    return {};
+  }
+  auto app_info = get_app_info_by_name(app_id, prefixes, cancellable);
   if (app_info) {
     return app_info;
   }
 
-  // App ids come from other clients and g_desktop_app_info_search() crashes on invalid UTF-8
-  if (!g_utf8_validate(app_id.c_str(), app_id.size(), nullptr)) {
+  // GLib's desktop app search requires valid UTF-8.
+  if ((cancellable && g_cancellable_is_cancelled(cancellable)) ||
+      !g_utf8_validate(app_id.c_str(), app_id.size(), nullptr)) {
     return {};
   }
 
-  // The search walks the index of every installed application once per word of app_id
+  // The search walks the index of installed applications once per word of app_id.
   gchar** search_words = g_str_tokenize_and_fold(app_id.c_str(), nullptr, nullptr);
   const guint n_search_words = g_strv_length(search_words);
   g_strfreev(search_words);
@@ -87,9 +102,16 @@ Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_desktop_app_info(const std::st
 
   std::string desktop_file = "";
 
-  gchar*** desktop_list = g_desktop_app_info_search(app_id.c_str());
+  gchar*** desktop_list;
+  {
+    waybar::util::ScopedTrace search_trace("g_desktop_app_info_search app_id={}", app_id);
+    desktop_list = g_desktop_app_info_search(app_id.c_str());
+  }
   if (desktop_list != nullptr && desktop_list[0] != nullptr) {
     for (size_t i = 0; desktop_list[0][i]; i++) {
+      if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+        break;
+      }
       if (desktop_file == "") {
         desktop_file = desktop_list[0][i];
       } else {
@@ -117,7 +139,7 @@ Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_desktop_app_info(const std::st
   if (desktop_file.empty()) {
     return {};
   }
-  return get_app_info_by_name(desktop_file);
+  return get_app_info_by_name(desktop_file, prefixes, cancellable);
 }
 
 Glib::RefPtr<Gdk::Pixbuf> IconLoader::load_icon_from_file(std::string const& icon_path, int size) {
@@ -138,6 +160,8 @@ std::string IconLoader::get_icon_name_from_icon_theme(
 
 bool IconLoader::image_load_icon(Gtk::Image& image, const Glib::RefPtr<Gtk::IconTheme>& icon_theme,
                                  Glib::RefPtr<Gio::DesktopAppInfo> app_info, int size) {
+  waybar::util::ScopedTrace trace("IconLoader::image_load_icon size={} scale={}", size,
+                                  image.get_scale_factor());
   std::string ret_icon_name = "unknown";
   if (app_info) {
     std::string icon_name =
@@ -200,18 +224,50 @@ bool IconLoader::image_load_icon(Gtk::Image& image, Glib::RefPtr<Gio::DesktopApp
   return image_load_icon(image, default_icon_theme_, app_info, size);
 }
 
+void IconLoader::load_icon_async(Glib::RefPtr<Gio::DesktopAppInfo> app_info, int size, int scale,
+                                 const Glib::RefPtr<Gio::Cancellable>& cancellable,
+                                 waybar::util::IconReady ready) const {
+  waybar::util::ScopedTrace trace("IconLoader::load_icon_async size={} scale={}", size, scale);
+  waybar::util::IconSources sources;
+  const auto append_theme = [&](const Glib::RefPtr<Gtk::IconTheme>& theme) {
+    if (app_info) {
+      const auto wm_class = app_info->get_startup_wm_class();
+      if (!wm_class.empty()) {
+        sources.push_back({.icon = Gio::ThemedIcon::create(wm_class), .theme = theme});
+      }
+      if (auto icon = app_info->get_icon()) {
+        sources.push_back({.icon = icon, .theme = theme});
+      }
+    } else {
+      sources.push_back({.icon = Gio::ThemedIcon::create("unknown"), .theme = theme});
+    }
+  };
+  for (const auto& theme : custom_icon_themes_) append_theme(theme);
+  append_theme({});
+  sources.push_back({.icon = Gio::ThemedIcon::create("image-missing")});
+  waybar::util::loadIconAsync(std::move(sources), size, scale, {}, cancellable, std::move(ready));
+}
+
 Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_from_app_id_list(
-    const std::string& app_id_list) {
+    const std::string& app_id_list, GCancellable* cancellable) {
+  waybar::util::ScopedTrace trace("IconLoader::get_app_info_from_app_id_list app_id={}",
+                                  app_id_list);
   std::string app_id;
   std::istringstream stream(app_id_list);
-  // Bounds the cost of the desktop app searches of the whole list, whatever its shape
+  // Keep the search paths alive while a cancelled worker unwinds during shutdown.
+  const auto prefixes = search_prefix();
+  // Bound the cost of desktop app searches across the whole peer-supplied list.
   guint search_words_left = 32;
+  const auto lookup = [&](const std::string& id) {
+    return get_desktop_app_info(id, prefixes, search_words_left, cancellable);
+  };
 
-  /* Wayfire sends a list of app-id's in space separated format, other compositors
-   * send a single app-id. The list comes from other clients and a miss costs hundreds of file
-   * probes on the main thread, so only the first entries are tried */
+  // Wayfire sends a space-separated list of app ids. Other compositors send a single id.
   for (int i = 0; i < 8 && stream >> app_id; i++) {
-    auto app_info = get_desktop_app_info(app_id, search_words_left);
+    if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+      return {};
+    }
+    auto app_info = lookup(app_id);
     if (app_info) {
       return app_info;
     }
@@ -221,7 +277,7 @@ Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_from_app_id_list(
       return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     });
     if (lower_app_id != app_id) {
-      app_info = get_desktop_app_info(lower_app_id, search_words_left);
+      app_info = lookup(lower_app_id);
       if (app_info) {
         return app_info;
       }
@@ -230,7 +286,7 @@ Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_from_app_id_list(
     // npos + 1 wraps to 0: no '.' keeps the whole id
     auto app_name = app_id.substr(app_id.rfind('.') + 1);
     if (app_name != app_id) {
-      app_info = get_desktop_app_info(app_name, search_words_left);
+      app_info = lookup(app_name);
       if (app_info) {
         return app_info;
       }
@@ -238,7 +294,7 @@ Glib::RefPtr<Gio::DesktopAppInfo> IconLoader::get_app_info_from_app_id_list(
 
     app_name = app_id.substr(0, app_id.find('-'));
     if (app_name != app_id) {
-      app_info = get_desktop_app_info(app_name, search_words_left);
+      app_info = lookup(app_name);
       if (app_info) {
         return app_info;
       }

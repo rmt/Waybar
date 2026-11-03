@@ -20,6 +20,8 @@ AddressSanitizer** and runs the real binary inside a **headless** compositor
 | 3 | **Layout matrix** — top / bottom / left (vertical) + HiDPI (scale 2) | [`positions.sh`](positions.sh) |
 | 3 | **Second compositor** — same launch under `labwc` | workflow (`COMPOSITOR=labwc`) |
 | 4 | **Lifecycle / teardown** — clean SIGINT exit, runtime **output hotplug**, toggle + reload churn, fast-interval teardown (the C++ destructor path a `kill` never runs, #5182) | [`lifecycle.sh`](lifecycle.sh) |
+| 4 | **Taskbar startup** — inject a two-second worker lookup; require UI responsiveness, first-draw gating, no placeholder searches, safe cancellation/reload/early exit, UI-only GTK operations | [`taskbar-startup.sh`](taskbar-startup.sh) (standalone) |
+| 4 | **Tray icons** — real SNI fixture with pixel assertions for attention/overlay/symbolic/custom/pixmap icons, HiDPI, reload and removal | [`tray-icons.sh`](tray-icons.sh) (standalone) |
 | 4 | **Custom-backend fuzz** — empty / non-zero-exit / invalid-JSON / huge / non-UTF8 / empty-format exec output | [`fuzz.sh`](fuzz.sh) |
 | 5 | **State transitions** - real `mpd` driven from an **empty queue** (#5183) through play / next / pause / stop / clear / server exit, `pulseaudio` + slider on a null sink through volume and mute changes; each state's text asserted over AT-SPI | [`state.sh`](state.sh) |
 | 6 | **Fake hardware** - `battery` (discharging / charging / full, time estimates), `backlight`, `backlight/slider` in a group (#5179) and `temperature` (critical threshold) on a **umockdev** sysfs tree whose attributes change mid-run; exact text asserted over AT-SPI | [`hardware.sh`](hardware.sh) |
@@ -72,10 +74,17 @@ dbus-run-session -- ./test/smoke/compositor.sh   # also needs foot, wayland-info
 dbus-run-session -- ./test/smoke/tray.sh
 dbus-run-session -- ./test/smoke/ipc.sh
 dbus-run-session -- ./test/smoke/dbus.sh     # needs python3-dbusmock
+
 # need extra daemons / tools:
 dbus-run-session -- ./test/smoke/state.sh    # needs mpd + mpc, pulseaudio
 dbus-run-session -- ./test/smoke/hardware.sh # needs umockdev
 dbus-run-session -- ./test/smoke/procfs.sh   # needs bwrap and unprivileged user namespaces
 ./test/smoke/leakcheck.sh                    # needs an ASan build
 ./test/smoke/soak.sh                         # about 5 minutes
+# Standalone regressions create private compositor/D-Bus sessions.
+# Taskbar needs Python GTK3 and a C compiler; tray needs Python GIO/GdkPixbuf.
+bash ./test/smoke/taskbar-startup.sh
+bash ./test/smoke/tray-icons.sh
+# Async icon tests need a display and run inside taskbar-startup.sh automatically.
+# Without a display, ordinary `meson test` skips that test.
 ```

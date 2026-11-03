@@ -6,6 +6,7 @@
 
 #include "modules/sni/item.hpp"
 #include "util/scope_guard.hpp"
+#include "util/trace.hpp"
 
 namespace waybar::modules::SNI {
 
@@ -81,6 +82,7 @@ void Host::checkIgnoreList(const std::vector<std::string>& ignore_list,
       if (item->bus_name.find(ignored) != std::string::npos ||
           item->category.find(ignored) != std::string::npos ||
           item->icon_name.find(ignored) != std::string::npos ||
+          item->customIcon().find(ignored) != std::string::npos ||
           item->id.find(ignored) != std::string::npos ||
           item->title.find(ignored) != std::string::npos) {
         spdlog::info(
@@ -102,6 +104,7 @@ void Host::checkIgnoreList(const std::vector<std::string>& ignore_list,
 }
 
 void Host::busAcquired(const Glib::RefPtr<Gio::DBus::Connection>& conn, const Glib::ustring& name) {
+  util::ScopedTrace trace("SNI::Host::busAcquired");
   watcher_id_ = Gio::DBus::watch_name(conn, "org.kde.StatusNotifierWatcher",
                                       sigc::mem_fun(*this, &Host::nameAppeared),
                                       sigc::mem_fun(*this, &Host::nameVanished));
@@ -109,6 +112,7 @@ void Host::busAcquired(const Glib::RefPtr<Gio::DBus::Connection>& conn, const Gl
 
 void Host::nameAppeared(const Glib::RefPtr<Gio::DBus::Connection>& conn, const Glib::ustring& name,
                         const Glib::ustring& name_owner) {
+  util::ScopedTrace trace("SNI::Host::nameAppeared");
   if (cancellable_ != nullptr) {
     // TODO
     return;
@@ -136,6 +140,7 @@ void Host::nameVanished(const Glib::RefPtr<Gio::DBus::Connection>& conn,
 }
 
 void Host::proxyReady(GObject* src, GAsyncResult* res, gpointer data) {
+  util::ScopedTrace trace("SNI::Host::proxyReady");
   GError* error = nullptr;
   waybar::util::ScopeGuard error_deleter([&error]() {
     if (error != nullptr) {
@@ -191,6 +196,7 @@ void Host::proxyReady(GObject* src, GAsyncResult* res, gpointer data) {
 }
 
 void Host::registerHost(GObject* src, GAsyncResult* res, gpointer data) {
+  util::ScopedTrace trace("SNI::Host::registerHost");
   GError* error = nullptr;
   waybar::util::ScopeGuard error_deleter([&error]() {
     if (error != nullptr) {
@@ -290,6 +296,7 @@ void Host::addRegisteredItem(const std::string& service) {
     spdlog::warn("Host: Ignoring service of {} bytes", service.size());
     return;
   }
+  util::ScopedTrace trace("SNI::Host::addRegisteredItem service={}", service);
   // Check service string directly before parsing
   for (const auto& ignored : ignore_list_) {
     if (service.find(ignored) != std::string::npos) {

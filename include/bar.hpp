@@ -130,6 +130,7 @@ class Bar : public sigc::trackable {
   void setPassThrough(bool passthrough);
   void setPosition(Gtk::PositionType position);
   void forceLayerCommit();
+  void traceWindowState(const char* phase);
   void onConfigure(GdkEventConfigure* ev);
   void configureGlobalOffset(int width, int height);
   void onOutputGeometryChanged();

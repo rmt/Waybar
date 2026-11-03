@@ -4,13 +4,16 @@
 #include <gdkmm/general.h>
 #include <giomm/memoryinputstream.h>
 #include <giomm/unixinputstream.h>
+#include <giomm/themedicon.h>
 #include <glibmm/main.h>
 #include <gtkmm/tooltip.h>
 #include <spdlog/spdlog.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +29,8 @@
 #include "util/format.hpp"  // IWYU pragma: keep
 #include "util/gtk_icon.hpp"
 #include "util/tooltip.hpp"
+#include "util/async_icon.hpp"
+#include "util/trace.hpp"
 
 template <>
 struct fmt::formatter<Glib::VariantBase> : formatter<std::string> {
@@ -97,6 +102,10 @@ Item::Item(const std::string& bn, const std::string& op, const Json::Value& conf
   // initial visibility
   event_box.show_all();
   event_box.set_visible(show_passive_);
+  image.property_scale_factor().signal_changed().connect(
+      sigc::track_obj([this] { updateImage(); }, *this));
+  event_box.signal_style_updated().connect(sigc::mem_fun(*this, &Item::updateImage));
+  Gtk::IconTheme::get_default()->signal_changed().connect(sigc::mem_fun(*this, &Item::updateImage));
 
   cancellable_ = Gio::Cancellable::create();
 
@@ -109,6 +118,9 @@ Item::Item(const std::string& bn, const std::string& op, const Json::Value& conf
 }
 
 Item::~Item() {
+  destroying_ = true;
+  if (image_cancellable_) image_cancellable_->cancel();
+  if (cancellable_) cancellable_->cancel();
   if (this->gtk_menu != nullptr) {
     this->gtk_menu->popdown();
     this->gtk_menu->detach();
@@ -143,7 +155,15 @@ bool Item::handleMouseLeave(GdkEventCrossing* const& e) {
   return false;
 }
 
-void Item::onConfigure(GdkEventConfigure* ev) { this->updateImage(); }
+void Item::onConfigure(GdkEventConfigure* ev) {
+  if (destroying_) return;
+  // A loaded icon can itself resize the bar. Do not cancel/reload an unchanged request
+  // on that configure event, or an async load may never get a chance to finish.
+  if (requested_icon_size_ != std::max(1, icon_size) ||
+      requested_icon_scale_ != image.get_scale_factor()) {
+    updateImage();
+  }
+}
 
 // The proxy caches whatever the item announces, of any name and size, and nothing reads it. A raw
 // handler: glibmm's signal_properties_changed() unpacks the names into a collating std::map.
@@ -158,6 +178,7 @@ static void dropChangedProperties(GDBusProxy* proxy, GVariant* changed, GStrv /*
 }
 
 void Item::proxyReady(Glib::RefPtr<Gio::AsyncResult>& result) {
+  util::ScopedTrace trace("SNI::Item::proxyReady service={} path={}", bus_name, object_path);
   try {
     this->proxy_ = Gio::DBus::Proxy::create_for_bus_finish(result);
     /* Properties are already cached during object creation */
@@ -264,17 +285,10 @@ void Item::setProperty(const std::string& name, Glib::VariantBase& value) {
     } else if (name == "Status") {
       setStatus(get_variant<Glib::ustring>(value));
     } else if (name == "IconName") {
-      if (has_custom_icon_) {
-        spdlog::trace("Item '{}': ignoring IconName update, custom icon is set", id);
-      } else {
-        icon_name = get_variant<std::string>(value);
-      }
+      // Retain the remote icon as a fallback if a configured custom icon cannot be loaded.
+      icon_name = get_variant<std::string>(value);
     } else if (name == "IconPixmap") {
-      if (has_custom_icon_) {
-        spdlog::trace("Item '{}': ignoring IconPixmap update, custom icon is set", id);
-      } else {
-        icon_pixmap = this->extractPixBuf(value.gobj());
-      }
+      icon_pixmap = this->extractPixBuf(value.gobj());
     } else if (name == "OverlayIconName") {
       overlay_icon_name = get_variant<std::string>(value);
     } else if (name == "OverlayIconPixmap") {
@@ -361,22 +375,10 @@ void Item::setCustomIcon(const std::string& id) {
     host_.reorderItems();
   }
 
-  std::string custom_icon = IconManager::instance().getIconForApp(id);
-  if (!custom_icon.empty()) {
-    if (std::filesystem::exists(custom_icon)) {
-      try {
-        Glib::RefPtr<Gdk::Pixbuf> custom_pixbuf = Gdk::Pixbuf::create_from_file(custom_icon);
-        icon_name = "";  // icon_name has priority over pixmap
-        icon_pixmap = custom_pixbuf;
-        has_custom_icon_ = true;
-      } catch (const Glib::Error& e) {
-        spdlog::error("Failed to load custom icon {}: {}", custom_icon, e.what());
-      }
-    } else {  // if file doesn't exist it's most likely an icon_name
-      icon_name = custom_icon;
-      has_custom_icon_ = true;
-    }
-  }
+  // Resolve custom file/name overrides with the rest of the async icon request, not
+  // synchronously while processing D-Bus properties.
+  custom_icon_ = IconManager::instance().getIconForApp(id);
+  has_custom_icon_ = !custom_icon_.empty();
 }
 
 void Item::getUpdatedProperties() {
@@ -509,197 +511,24 @@ Glib::RefPtr<Gdk::Pixbuf> Item::extractPixBuf(GVariant* variant) {
   return Glib::RefPtr<Gdk::Pixbuf>{};
 }
 
-void Item::updateImage() {
-  auto pixbuf = getIconPixbuf();
-  if (!pixbuf) return;
-  auto scaled_icon_size = getScaledIconSize();
-
-  // If the loaded icon is not square, assume that the icon height should match the
-  // requested icon size, but the width is allowed to be different. As such, if the
-  // height of the image does not match the requested icon size, resize the icon such that
-  // the aspect ratio is maintained, but the height matches the requested icon size.
-  // The width is bounded too: an arbitrarily wide icon would grow the bar past the output.
-  const double max_width = std::max(1.0, scaled_icon_size * MAX_ICON_ASPECT_RATIO);
-  if (pixbuf->get_height() > 0 &&
-      (pixbuf->get_height() != scaled_icon_size || pixbuf->get_width() > max_width)) {
-    double width = scaled_icon_size * pixbuf->get_width() / pixbuf->get_height();
-    pixbuf = pixbuf->scale_simple(static_cast<int>(std::clamp(width, 1.0, max_width)),
-                                  scaled_icon_size, Gdk::InterpType::INTERP_BILINEAR);
-    if (!pixbuf) return;
-  }
-
-  pixbuf = overlayPixbufs(pixbuf, getOverlayIconPixbuf());
-
-  auto surface =
-      Gdk::Cairo::create_surface_from_pixbuf(pixbuf, image.get_scale_factor(), image.get_window());
-  image.set(surface);
-}
-
-Glib::RefPtr<Gdk::Pixbuf> Item::getIconPixbuf() {
-  if (status_ == "needsattention") {
-    if (auto attention_pixbuf = getAttentionIconPixbuf()) {
-      return attention_pixbuf;
-    }
-  }
-
-  if (auto pixbuf = loadIconFromNameOrFile(icon_name, true)) {
-    return pixbuf;
-  }
-
-  if (icon_pixmap) {
-    return icon_pixmap;
-  }
-
-  if (icon_name.empty()) {
-    spdlog::error("Item '{}': No icon name or pixmap given.", id);
-  } else {
-    spdlog::error("Item '{}': Could not find an icon named '{}' and no pixmap given.", id,
-                  icon_name);
-  }
-
-  return getIconByName("image-missing", getScaledIconSize());
-}
-
-Glib::RefPtr<Gdk::Pixbuf> Item::getAttentionIconPixbuf() {
-  if (auto pixbuf = loadIconFromNameOrFile(attention_icon_name, false)) {
-    return pixbuf;
-  }
-  if (auto pixbuf = loadIconFromNameOrFile(attention_movie_name, false)) {
-    return pixbuf;
-  }
-  return attention_icon_pixmap;
-}
-
-Glib::RefPtr<Gdk::Pixbuf> Item::getOverlayIconPixbuf() {
-  if (auto pixbuf = loadIconFromNameOrFile(overlay_icon_name, false)) {
-    return pixbuf;
-  }
-  return overlay_icon_pixmap;
-}
-
-// Loads an icon file an item named, at the given height, or returns null if it is refused. Only a
-// regular file is read, through the opened descriptor so it cannot be swapped for a FIFO, and only
-// PNG (size checked in its header) and SVG (rendered at that height) are decoded: gdk-pixbuf
-// decodes other formats at the size the file declares, whatever height is asked for.
-static Glib::RefPtr<Gdk::Pixbuf> loadIconFromFile(const std::string& path, int height) {
-  int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-  if (fd == -1) {
-    return {};
-  }
-  auto file_stream = Gio::UnixInputStream::create(fd, true);
-  struct stat st;
-  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-      st.st_size > MAX_ICON_FILE_SIZE) {
-    spdlog::warn("Tray: refusing icon file '{}': not a regular file of at most {} bytes", path,
-                 MAX_ICON_FILE_SIZE);
-    return {};
-  }
-  auto stream = Gio::MemoryInputStream::create();
-  auto* data = static_cast<guint8*>(g_malloc(st.st_size));
-  g_memory_input_stream_add_data(stream->gobj(), data, st.st_size, g_free);
-  gsize size = 0;
-  file_stream->read_all(data, st.st_size, size);
-  if (size != static_cast<gsize>(st.st_size)) {
-    return {};
-  }
-
-  static const guint8 png_header[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
-                                      0,    0,   0,   13,  'I',  'H',  'D',  'R'};
-  bool accepted = false;
-  if (size >= sizeof(png_header) + 8 && std::memcmp(data, png_header, sizeof(png_header)) == 0) {
-    guint32 width = 0;
-    guint32 png_height = 0;
-    std::memcpy(&width, data + sizeof(png_header), 4);
-    std::memcpy(&png_height, data + sizeof(png_header) + 4, 4);
-    accepted = static_cast<guint64>(GUINT32_FROM_BE(width)) * GUINT32_FROM_BE(png_height) <=
-               MAX_ICON_FILE_PIXELS;
-  } else {
-    // By content like gdk-pixbuf does; the file name is the item's choice
-    g_autofree gchar* type = g_content_type_guess(nullptr, data, size, nullptr);
-    accepted = g_content_type_is_a(type, "image/svg+xml") != FALSE;
-  }
-  if (!accepted) {
-    spdlog::warn("Tray: refusing icon file '{}': not a PNG of at most {} pixels or an SVG", path,
-                 MAX_ICON_FILE_PIXELS);
-    return {};
-  }
-  return Gdk::Pixbuf::create_from_stream_at_scale(stream, -1, height, true);
-}
-
-Glib::RefPtr<Gdk::Pixbuf> Item::loadIconFromNameOrFile(const std::string& name, bool log_failure) {
-  if (name.empty()) {
-    return {};
-  }
-
-  try {
-    if (name.front() == '/') {
-      if (auto pixbuf = loadIconFromFile(name, getScaledIconSize())) {
-        return pixbuf;
-      }
-    }
-  } catch (const Glib::Error& e) {
-    if (log_failure) {
-      spdlog::warn("Item '{}': {}", id, static_cast<std::string>(e.what()));
-    }
-  }
-
-  try {
-    return getIconByName(name, getScaledIconSize());
-  } catch (const Glib::Error& e) {
-    if (log_failure) {
-      spdlog::trace("Item '{}': {}", id, static_cast<std::string>(e.what()));
-    }
-  }
-
-  return {};
-}
-
-Glib::RefPtr<Gdk::Pixbuf> Item::overlayPixbufs(const Glib::RefPtr<Gdk::Pixbuf>& base,
-                                               const Glib::RefPtr<Gdk::Pixbuf>& overlay) {
-  if (!base || !overlay) {
-    return base;
-  }
-
-  auto composed = base->copy();
-  if (!composed) {
-    return base;
-  }
-
-  int overlay_target_size =
-      std::max(1, std::min(composed->get_width(), composed->get_height()) / 2);
-  auto scaled_overlay = overlay->scale_simple(overlay_target_size, overlay_target_size,
-                                              Gdk::InterpType::INTERP_BILINEAR);
-  if (!scaled_overlay) {
-    return composed;
-  }
-
-  int dest_x = std::max(0, composed->get_width() - scaled_overlay->get_width());
-  int dest_y = std::max(0, composed->get_height() - scaled_overlay->get_height());
-  scaled_overlay->composite(composed, dest_x, dest_y, scaled_overlay->get_width(),
-                            scaled_overlay->get_height(), dest_x, dest_y, 1.0, 1.0,
-                            Gdk::InterpType::INTERP_BILINEAR, 255);
-  return composed;
-}
-
 // Finds an icon in the item's IconThemePath, where items keep their icons: in
 // <path>/hicolor/<size>/<context>/ (closest size first), then in <path>/. The directory must not
 // become a GtkIconTheme search path: GTK maps any icon-theme.cache there without validating it.
 static std::string findIconInThemePath(const std::string& theme_path, const std::string& name,
-                                       int request_size) {
+                                       int request_size, GCancellable* cancellable) {
   namespace fs = std::filesystem;
 
-  if (name.find('/') != std::string::npos) {
+  if (name.empty() || name.find('/') != std::string::npos ||
+      (cancellable != nullptr && g_cancellable_is_cancelled(cancellable))) {
     return {};
   }
 
   std::error_code ec;
-  auto find_in_dir = [&name, &ec](const fs::path& dir) -> std::string {
-    // Same order of preference as GTK
+  auto find_in_dir = [&name, &ec, cancellable](const fs::path& dir) -> std::string {
     for (const auto* suffix : {".symbolic.png", ".png", ".svg"}) {
+      if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) return {};
       auto file = dir / (name + suffix);
-      if (fs::is_regular_file(file, ec)) {
-        return file.string();
-      }
+      if (fs::is_regular_file(file, ec)) return file.string();
     }
     return {};
   };
@@ -707,19 +536,17 @@ static std::string findIconInThemePath(const std::string& theme_path, const std:
   std::string best;
   int best_difference = 0;
   const fs::directory_iterator end;
-  for (fs::directory_iterator size_dir(fs::path(theme_path) / "hicolor", ec); size_dir != end;
-       size_dir.increment(ec)) {
-    // "16x16" or "16x16@2x"; anything else, e.g. "scalable", fits every size
+  for (fs::directory_iterator size_dir(fs::path(theme_path) / "hicolor", ec);
+       size_dir != end && !ec; size_dir.increment(ec)) {
+    if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) return {};
     int size = 0;
     int scale = 1;
     int difference = 0;
     if (std::sscanf(size_dir->path().filename().c_str(), "%4dx%*4d@%1d", &size, &scale) > 0) {
       difference = std::abs((size * scale) - request_size);
     }
-    if (!best.empty() && difference >= best_difference) {
-      continue;
-    }
-    for (fs::directory_iterator context_dir(size_dir->path(), ec); context_dir != end;
+    if (!best.empty() && difference >= best_difference) continue;
+    for (fs::directory_iterator context_dir(size_dir->path(), ec); context_dir != end && !ec;
          context_dir.increment(ec)) {
       if (auto file = find_in_dir(context_dir->path()); !file.empty()) {
         best = file;
@@ -731,41 +558,160 @@ static std::string findIconInThemePath(const std::string& theme_path, const std:
   return !best.empty() ? best : find_in_dir(theme_path);
 }
 
-Glib::RefPtr<Gdk::Pixbuf> Item::getIconByName(const std::string& name, int request_size) {
-  if (!icon_theme_path.empty()) {
-    auto file = findIconInThemePath(icon_theme_path, name, request_size);
-    auto pixbuf = file.empty() ? Glib::RefPtr<Gdk::Pixbuf>() : loadIconFromFile(file, request_size);
-    if (pixbuf) {
-      // GTK draws symbolic icons in the foreground color; its other symbolic colors are not kept
-      if ((file.ends_with("-symbolic.svg") || file.ends_with(".symbolic.png")) &&
-          pixbuf->get_has_alpha() && pixbuf->get_n_channels() == 4) {
-        auto style = event_box.get_style_context();
-        auto color = style->get_color(style->get_state());
-        const auto red = static_cast<guint8>(color.get_red() * 255);
-        const auto green = static_cast<guint8>(color.get_green() * 255);
-        const auto blue = static_cast<guint8>(color.get_blue() * 255);
-        const double alpha = color.get_alpha();
-        for (int y = 0; y < pixbuf->get_height(); ++y) {
-          guint8* pixel = pixbuf->get_pixels() + (y * pixbuf->get_rowstride());
-          for (int x = 0; x < pixbuf->get_width(); ++x, pixel += 4) {
-            pixel[0] = red;
-            pixel[1] = green;
-            pixel[2] = blue;
-            pixel[3] = static_cast<guint8>(pixel[3] * alpha);
-          }
-        }
-      }
-      return pixbuf;
-    }
+static util::IconWorkerResult loadIconFromFile(const std::string& path, int height,
+                                               GCancellable* cancellable) {
+  int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+  if (fd == -1) return {};
+  struct FdGuard {
+    int fd;
+    ~FdGuard() { close(fd); }
+  } guard{fd};
+
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+      st.st_size > MAX_ICON_FILE_SIZE) {
+    spdlog::warn("Tray: refusing icon file '{}': not a regular file of at most {} bytes", path,
+                 MAX_ICON_FILE_SIZE);
+    return {};
   }
-  return DefaultGtkIconThemeWrapper::load_icon(name.c_str(), request_size,
-                                               Gtk::IconLookupFlags::ICON_LOOKUP_FORCE_SIZE,
-                                               event_box.get_style_context());
+  if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) return {};
+
+  auto stream = Gio::MemoryInputStream::create();
+  auto* data = static_cast<guint8*>(g_malloc(static_cast<gsize>(st.st_size)));
+  g_memory_input_stream_add_data(stream->gobj(), data, st.st_size, g_free);
+  gsize offset = 0;
+  while (offset < static_cast<gsize>(st.st_size)) {
+    if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) return {};
+    const auto count = read(fd, data + offset, static_cast<size_t>(st.st_size) - offset);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return {};
+    offset += static_cast<gsize>(count);
+  }
+
+  static const guint8 png_header[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
+                                      0,    0,   0,   13,  'I',  'H',  'D',  'R'};
+  bool accepted = false;
+  if (offset >= sizeof(png_header) + 8 &&
+      std::memcmp(data, png_header, sizeof(png_header)) == 0) {
+    guint32 width = 0;
+    guint32 png_height = 0;
+    std::memcpy(&width, data + sizeof(png_header), 4);
+    std::memcpy(&png_height, data + sizeof(png_header) + 4, 4);
+    accepted = static_cast<guint64>(GUINT32_FROM_BE(width)) * GUINT32_FROM_BE(png_height) <=
+               MAX_ICON_FILE_PIXELS;
+  } else {
+    g_autofree gchar* type = g_content_type_guess(nullptr, data, offset, nullptr);
+    accepted = type != nullptr && g_content_type_is_a(type, "image/svg+xml") != FALSE;
+  }
+  if (!accepted) {
+    spdlog::warn("Tray: refusing icon file '{}': not a PNG of at most {} pixels or an SVG", path,
+                 MAX_ICON_FILE_PIXELS);
+    return {};
+  }
+
+  try {
+    const int width = height * MAX_ICON_ASPECT_RATIO;
+    return {.pixbuf = Gdk::Pixbuf::create_from_stream_at_scale(stream, width, height, true),
+            .symbolic = path.ends_with("-symbolic.svg") || path.ends_with(".symbolic.png")};
+  } catch (const Glib::Error&) {
+    return {};
+  }
 }
 
-double Item::getScaledIconSize() {
-  // apply the scale factor from the Gtk window to the requested icon size
-  return icon_size * image.get_scale_factor();
+static util::IconWorkerResult loadThemeIcon(const std::string& theme_path, const std::string& name,
+                                            int height, GCancellable* cancellable) {
+  auto file = findIconInThemePath(theme_path, name, height, cancellable);
+  return file.empty() ? util::IconWorkerResult{} : loadIconFromFile(file, height, cancellable);
+}
+
+void Item::updateImage() {
+  util::ScopedTrace trace("SNI::Item::updateImage service={} path={}", bus_name, object_path);
+  if (destroying_) return;
+  if (image_cancellable_) image_cancellable_->cancel();
+  auto cancellable = Gio::Cancellable::create();
+  image_cancellable_ = cancellable;
+  const int size = requested_icon_size_ = std::max(1, icon_size);
+  const int scale = requested_icon_scale_ = image.get_scale_factor();
+  auto style = event_box.get_style_context();
+  const auto append_name = [&](util::IconSources& sources, const std::string& name) {
+    if (name.empty()) return;
+    if (g_path_is_absolute(name.c_str())) {
+      sources.push_back({.worker = [name](int size, int scale, GCancellable* token) {
+                           return loadIconFromFile(name, size * scale, token);
+                         }});
+      return;
+    }
+    if (!icon_theme_path.empty()) {
+      const auto theme_path = icon_theme_path;
+      sources.push_back({.worker = [theme_path, name](int size, int scale, GCancellable* token) {
+        return loadThemeIcon(theme_path, name, size * scale, token);
+      }});
+    }
+    sources.push_back({.icon = Gio::ThemedIcon::create(name), .symbolic = true});
+  };
+  util::IconSources base, overlay;
+  if (status_ == "needsattention") {
+    append_name(base, attention_icon_name);
+    append_name(base, attention_movie_name);
+    if (attention_icon_pixmap) base.push_back({.pixbuf = attention_icon_pixmap});
+  }
+  append_name(base, custom_icon_);
+  append_name(base, icon_name);
+  if (icon_pixmap) base.push_back({.pixbuf = icon_pixmap});
+  base.push_back({.icon = Gio::ThemedIcon::create("image-missing"), .symbolic = true});
+  append_name(overlay, overlay_icon_name);
+  if (overlay_icon_pixmap) overlay.push_back({.pixbuf = overlay_icon_pixmap});
+
+  util::loadIconAsync(
+      std::move(base), size, scale, style, cancellable,
+      [this, cancellable, size, scale, style,
+       overlay = std::move(overlay)](Glib::RefPtr<Gdk::Pixbuf> pixbuf) mutable {
+        if (image_cancellable_ != cancellable) return;
+        if (!pixbuf) {
+          image_cancellable_.reset();
+          return;
+        }
+        util::loadIconAsync(
+            std::move(overlay), size, scale, style, cancellable,
+            [this, cancellable, size, scale, pixbuf](Glib::RefPtr<Gdk::Pixbuf> badge) mutable {
+              if (image_cancellable_ != cancellable) return;
+              image_cancellable_.reset();
+              util::ScopedTrace trace("SNI icon applied service={} path={} scale={}", bus_name,
+                                      object_path, scale);
+              const int pixels = size * scale;
+              if (pixbuf->get_height() > 0 &&
+                  (pixbuf->get_height() != pixels ||
+                   pixbuf->get_width() > pixels * MAX_ICON_ASPECT_RATIO)) {
+                const int width = std::max(1, pixels * pixbuf->get_width() / pixbuf->get_height());
+                const int max_width = pixels * MAX_ICON_ASPECT_RATIO;
+                pixbuf = pixbuf->scale_simple(std::min(width, max_width), pixels,
+                                              Gdk::InterpType::INTERP_BILINEAR);
+              }
+              if (!pixbuf) return;
+              pixbuf = overlayPixbufs(pixbuf, badge);
+              auto surface =
+                  Gdk::Cairo::create_surface_from_pixbuf(pixbuf, scale, image.get_window());
+              image.set(surface);
+            });
+      });
+}
+
+Glib::RefPtr<Gdk::Pixbuf> Item::overlayPixbufs(const Glib::RefPtr<Gdk::Pixbuf>& base,
+                                               const Glib::RefPtr<Gdk::Pixbuf>& overlay) {
+  if (!base || !overlay) return base;
+  auto composed = base->copy();
+  if (!composed) return base;
+  int overlay_target_size =
+      std::max(1, std::min(composed->get_width(), composed->get_height()) / 2);
+  auto scaled_overlay = overlay->scale_simple(overlay_target_size, overlay_target_size,
+                                              Gdk::InterpType::INTERP_BILINEAR);
+  if (!scaled_overlay) return composed;
+  int dest_x = std::max(0, composed->get_width() - scaled_overlay->get_width());
+  int dest_y = std::max(0, composed->get_height() - scaled_overlay->get_height());
+  scaled_overlay->composite(composed, dest_x, dest_y, scaled_overlay->get_width(),
+                            scaled_overlay->get_height(), dest_x, dest_y, 1.0, 1.0,
+                            Gdk::InterpType::INTERP_BILINEAR, 255);
+  return composed;
 }
 
 void Item::onMenuDestroyed(Item* self, GObject* old_menu_pointer) {
@@ -819,6 +765,7 @@ static GDBusMessage* filterMenuLayout(GDBusConnection* /*connection*/, GDBusMess
 }
 
 void Item::makeMenu() {
+  util::ScopedTrace trace("SNI::Item::makeMenu service={} path={}", bus_name, object_path);
   if (gtk_menu == nullptr && !menu.empty()) {
     // libdbusmenu uses the shared session bus connection of the proxies: one filter covers all
     [[maybe_unused]] static const guint layout_filter = g_dbus_connection_add_filter(

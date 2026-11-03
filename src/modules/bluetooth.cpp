@@ -8,12 +8,14 @@
 
 #include "util/scope_guard.hpp"
 #include "util/string.hpp"
+#include "util/trace.hpp"
 
 namespace {
 
 using GDBusManager = std::unique_ptr<GDBusObjectManager, void (*)(GDBusObjectManager*)>;
 
 auto generateManager() -> GDBusManager {
+  waybar::util::ScopedTrace trace("Bluetooth system bus manager creation (sync)");
   GError* error = nullptr;
   waybar::util::ScopeGuard error_deleter([error]() {
     if (error) {
